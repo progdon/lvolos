@@ -1,0 +1,466 @@
+
+import os
+import sys
+import logging
+import threading
+import time
+import glob
+from datetime import datetime, timedelta
+from flask import Flask, render_template, request, redirect, url_for, jsonify
+import psycopg2
+import psycopg2.extras
+from werkzeug.middleware.proxy_fix import ProxyFix
+from bot import bot
+from models import get_db_connection, get_guild_config, get_leaderboard, get_user_stats
+from utils.future_card import generate_future_rank_card, get_level_effect
+
+# Настройка уровня логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+logger = logging.getLogger(__name__)
+
+# Create Flask app with static files directory
+app = Flask(__name__, static_folder='static', static_url_path='/static')
+app.secret_key = os.environ.get("SESSION_SECRET", "dev_secret_key")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+# Создаем директорию для карточек, если она не существует
+os.makedirs('static/card_images', exist_ok=True)
+
+# Функция для очистки старых карточек
+def cleanup_old_card_images(max_age_hours=24):
+    """Очистка карточек старше указанного количества часов"""
+    try:
+        logger.info(f"Запуск очистки карточек старше {max_age_hours} часов")
+        card_dir = 'static/card_images'
+        count = 0
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        # Перебираем все файлы в директории
+        for filename in os.listdir(card_dir):
+            file_path = os.path.join(card_dir, filename)
+            
+            # Проверяем возраст файла
+            if os.path.isfile(file_path):
+                file_age = current_time - os.path.getmtime(file_path)
+                if file_age > max_age_seconds:
+                    try:
+                        os.remove(file_path)
+                        count += 1
+                    except Exception as e:
+                        logger.error(f"Ошибка при удалении файла {file_path}: {e}")
+        
+        logger.info(f"Очистка завершена, удалено {count} файлов карточек")
+        return count
+    except Exception as e:
+        logger.error(f"Ошибка при очистке карточек: {e}")
+        return 0
+
+# Периодическая очистка карточек
+def schedule_cleanup():
+    """Запуск периодической очистки карточек"""
+    while True:
+        try:
+            # Очищаем карточки старше 24 часов
+            cleanup_old_card_images(24)
+            # Спим 6 часов
+            time.sleep(6 * 3600)
+        except Exception as e:
+            logger.error(f"Ошибка в планировщике очистки: {e}")
+            time.sleep(3600)  # В случае ошибки ждем 1 час
+
+# Запускаем начальную очистку при старте
+cleanup_old_card_images(24)
+
+# Get Discord bot token
+TOKEN = os.getenv('DISCORD_TOKEN')
+if not TOKEN:
+    logger.warning("DISCORD_TOKEN environment variable not set! Bot will run in web-only mode.")
+    TOKEN = "web_only_mode"  # Используем фиктивный токен для запуска веб-интерфейса без бота
+
+# Flask routes
+@app.route('/')
+def index():
+    """Homepage with list of servers."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    # Get unique guild IDs
+    cursor.execute("SELECT DISTINCT guild_id FROM GuildSettings")
+    guilds = cursor.fetchall()
+    
+    guild_info = []
+    for guild in guilds:
+        guild_id = guild['guild_id']
+        # Get user count for this guild
+        cursor.execute("SELECT COUNT(*) FROM UserStats WHERE guild_id = %s", (guild_id,))
+        user_count = cursor.fetchone()[0]
+        
+        # Get guild name from bot cache if available
+        guild_name = f"Сервер {guild_id}"
+        discord_guild = bot.get_guild(guild_id)
+        if discord_guild:
+            guild_name = discord_guild.name
+        
+        guild_info.append({
+            'id': guild_id,
+            'name': guild_name,
+            'user_count': user_count
+        })
+    
+    conn.close()
+    return render_template('index.html', guilds=guild_info)
+
+@app.route('/guild/<int:guild_id>')
+def guild_stats(guild_id):
+    """Page for a specific guild's stats."""
+    # Get guild config
+    config = get_guild_config(guild_id)
+    
+    # Get leaderboard
+    leaderboard = get_leaderboard(guild_id, limit=50)
+    
+    # Resolve Discord usernames if bot is running
+    for user in leaderboard:
+        user_id = user['user_id']
+        user['name'] = f"Пользователь {user_id}"
+        discord_user = bot.get_user(user_id)
+        if discord_user:
+            user['name'] = discord_user.display_name
+            user['avatar'] = discord_user.avatar.url if discord_user.avatar else None
+    
+    # Get guild name
+    guild_name = f"Сервер {guild_id}"
+    discord_guild = bot.get_guild(guild_id)
+    if discord_guild:
+        guild_name = discord_guild.name
+    
+    return render_template(
+        'guild.html', 
+        guild_id=guild_id,
+        guild_name=guild_name,
+        config=config,
+        leaderboard=leaderboard,
+        unit_name=config['contribution_unit_name']
+    )
+
+@app.route('/user/<int:guild_id>/<int:user_id>')
+def user_stats(guild_id, user_id):
+    """Page for a specific user's stats on a guild."""
+    # Get user stats
+    stats = get_user_stats(user_id, guild_id)
+    
+    # Get guild config for level thresholds
+    config = get_guild_config(guild_id)
+    
+    # Calculate progress to next level
+    current_level = stats['current_level']
+    next_level = current_level + 1
+    
+    current_threshold = 0
+    if str(current_level) in config['level_thresholds']:
+        current_threshold = config['level_thresholds'][str(current_level)]
+    
+    next_threshold = None
+    if str(next_level) in config['level_thresholds']:
+        next_threshold = config['level_thresholds'][str(next_level)]
+        
+    progress = 0
+    if next_threshold is not None and next_threshold > current_threshold:
+        progress = min(100, ((stats['contribution'] - current_threshold) / (next_threshold - current_threshold)) * 100)
+    
+    # Get user name
+    user_name = f"Пользователь {user_id}"
+    discord_user = bot.get_user(user_id)
+    if discord_user:
+        user_name = discord_user.display_name
+        user_avatar = discord_user.avatar.url if discord_user.avatar else None
+    else:
+        user_avatar = None
+    
+    # Get guild name
+    guild_name = f"Сервер {guild_id}"
+    discord_guild = bot.get_guild(guild_id)
+    if discord_guild:
+        guild_name = discord_guild.name
+    
+    return render_template(
+        'user.html',
+        user_id=user_id,
+        user_name=user_name,
+        user_avatar=user_avatar,
+        guild_id=guild_id,
+        guild_name=guild_name,
+        stats=stats,
+        progress=progress,
+        next_threshold=next_threshold,
+        unit_name=config['contribution_unit_name']
+    )
+
+@app.route('/user/<int:guild_id>/<int:user_id>/future_card')
+def future_rank_card(guild_id, user_id):
+    """Страница с футуристической карточкой уровня."""
+    # Получаем статистику пользователя
+    stats = get_user_stats(user_id, guild_id)
+    
+    # Получаем конфигурацию сервера для порогов уровней
+    config = get_guild_config(guild_id)
+    
+    # Рассчитываем прогресс до следующего уровня
+    current_level = stats['current_level']
+    next_level = current_level + 1
+    
+    current_threshold = 0
+    if str(current_level) in config['level_thresholds']:
+        current_threshold = config['level_thresholds'][str(current_level)]
+    
+    next_threshold = None
+    if str(next_level) in config['level_thresholds']:
+        next_threshold = config['level_thresholds'][str(next_level)]
+    
+    # Рассчитываем прогресс в процентах
+    progress_percent = 0
+    total_seconds = stats.get('total_seconds', 0)
+    contribution_value = total_seconds / 3600.0  # Переводим в часы
+    
+    if next_threshold is not None and next_threshold > current_threshold:
+        progress_percent = min(100, int(((contribution_value - current_threshold) / (next_threshold - current_threshold)) * 100))
+    
+    # Получаем имя пользователя и аватар
+    user_info = {
+        'id': user_id,
+        'name': f"Пользователь {user_id}",
+        'avatar_url': None
+    }
+    
+    discord_user = bot.get_user(user_id)
+    if discord_user:
+        user_info['name'] = discord_user.display_name
+        user_info['avatar_url'] = discord_user.avatar.url if discord_user.avatar else None
+    
+    # Получаем имя сервера
+    guild_name = f"Сервер {guild_id}"
+    discord_guild = bot.get_guild(guild_id)
+    if discord_guild:
+        guild_name = discord_guild.name
+    
+    # Получаем информацию об эффектах для разных уровней
+    level_effects = {}
+    level_ranges = []
+    
+    # Описания эффектов для каждого диапазона уровней
+    effect_descriptions = {
+        (1, 5): {
+            'name': 'Простое неоновое свечение',
+            'description': 'Базовый эффект с голубым неоновым свечением.'
+        },
+        (6, 10): {
+            'name': 'Пульсирующее голографическое свечение',
+            'description': 'Голографический эффект с пульсирующим свечением.'
+        },
+        (11, 15): {
+            'name': 'Электрические разряды',
+            'description': 'Интенсивное свечение с эффектом электрических разрядов.'
+        },
+        (16, 20): {
+            'name': 'Звуковые волны',
+            'description': 'Визуализация звуковых волн, исходящих от карточки.'
+        },
+        (21, 25): {
+            'name': 'Киберпанк частицы',
+            'description': 'Анимированные киберпанк частицы и улучшенное свечение.'
+        },
+        (26, 30): {
+            'name': 'Голографическая матрица',
+            'description': 'Продвинутый голографический эффект с 3D-матрицей.'
+        },
+        (31, float('inf')): {
+            'name': 'Полный набор эффектов',
+            'description': 'Максимальные визуальные эффекты, доступные только элите.'
+        }
+    }
+    
+    # Заполняем информацию об эффектах
+    for level_range, effect_data in sorted(effect_descriptions.items()):
+        level_effect = get_level_effect(level_range[0])
+        effect_info = {
+            'icon': level_effect['icon'],
+            'name': effect_data['name'],
+            'description': effect_data['description']
+        }
+        
+        # Добавляем в словарь для всех уровней в диапазоне
+        for level in range(level_range[0], int(level_range[1]) + 1):
+            level_effects[level] = effect_info
+        
+        # Формируем строковое представление диапазона
+        if level_range[1] == float('inf'):
+            range_str = f"{level_range[0]}+"
+        else:
+            range_str = f"{level_range[0]}-{int(level_range[1])}"
+        
+        level_ranges.append((range_str, effect_info))
+    
+    return render_template(
+        'future_rank_card.html',
+        user=user_info,
+        user_stats=stats,
+        guild_id=guild_id,
+        guild_name=guild_name,
+        progress_percent=progress_percent,
+        current_contribution=format(current_threshold, '.2f'),
+        next_level_contribution=format(next_threshold, '.2f') if next_threshold else 'Максимум',
+        total_contribution=format(contribution_value, '.2f'),
+        unit_name=config['contribution_unit_name'],
+        level_effects=level_effects,
+        level_ranges=level_ranges
+    )
+    
+@app.route('/api/card_cleanup', methods=['POST'])
+def card_cleanup():
+    """Очистка директории с карточками от старых файлов."""
+    try:
+        # Убираем все файлы старше 24 часов (86400 секунд)
+        cleanup_age = request.json.get('max_age', 86400) if request.is_json else 86400
+        
+        card_dir = 'static/card_images'
+        count = 0
+        current_time = time.time()
+        
+        # Перебираем все файлы в директории
+        for filename in os.listdir(card_dir):
+            file_path = os.path.join(card_dir, filename)
+            
+            # Проверяем возраст файла
+            if os.path.isfile(file_path):
+                file_age = current_time - os.path.getmtime(file_path)
+                if file_age > cleanup_age:
+                    os.remove(file_path)
+                    count += 1
+        
+        return jsonify({'success': True, 'deleted_files': count})
+    except Exception as e:
+        logger.error(f"Ошибка при очистке карточек: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/card_images')
+def list_card_images():
+    """Список всех сгенерированных карточек рангов."""
+    try:
+        card_dir = os.path.join('static', 'card_images')
+        if not os.path.exists(card_dir):
+            os.makedirs(card_dir)
+            
+        cards = []
+        for filename in os.listdir(card_dir):
+            if filename.endswith('.jpg') or filename.endswith('.png'):
+                file_path = os.path.join(card_dir, filename)
+                creation_time = os.path.getmtime(file_path)
+                creation_date = datetime.fromtimestamp(creation_time).strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Извлекаем ID пользователя и сервера из имени файла
+                # Формат: card_{guild_id}_{user_id}_{timestamp}.jpg
+                parts = filename.split('_')
+                guild_id = parts[1] if len(parts) > 1 else "unknown"
+                user_id = parts[2] if len(parts) > 2 else "unknown"
+                
+                cards.append({
+                    'filename': filename,
+                    'url': url_for('static', filename=f'card_images/{filename}'),
+                    'created': creation_date,
+                    'guild_id': guild_id,
+                    'user_id': user_id
+                })
+        
+        # Сортируем по времени создания (самые новые сверху)
+        cards.sort(key=lambda x: x['created'], reverse=True)
+        
+        return render_template('card_images.html', cards=cards)
+    except Exception as e:
+        app.logger.error(f"Ошибка при получении списка карточек: {str(e)}")
+        return f"Ошибка при получении списка карточек: {str(e)}"
+
+
+@app.route('/levels')
+def levels():
+    """Page showing all level thresholds."""
+    # Use the first guild config as a template for the levels
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    # Get the first guild ID
+    cursor.execute("SELECT guild_id FROM GuildSettings LIMIT 1")
+    result = cursor.fetchone()
+    
+    if result:
+        guild_id = result['guild_id']
+        config = get_guild_config(guild_id)
+        thresholds = config['level_thresholds']
+        
+        # Get guild name
+        guild_name = f"Сервер {guild_id}"
+        discord_guild = bot.get_guild(guild_id)
+        if discord_guild:
+            guild_name = discord_guild.name
+    else:
+        # If no guilds exist, use default thresholds from screenshot
+        thresholds = {
+            "1": 0, "2": 1, "3": 4, "4": 13, "5": 30,
+            "6": 57, "7": 97, "8": 152, "9": 224, "10": 317,
+            "11": 431, "12": 571, "13": 737, "14": 933, "15": 1161,
+            "16": 1424, "17": 1723, "18": 2061, "19": 2441, "20": 2864,
+            "21": 3334, "22": 3853, "23": 4422, "24": 5046, "25": 5725,
+            "26": 6463, "27": 7261, "28": 8122, "29": 9049, "30": 10044,
+            "31": 11109, "32": 12247, "33": 13460, "34": 14750, "35": 16121,
+            "36": 17573, "37": 19111, "38": 20735, "39": 22449, "40": 24255,
+            "41": 26156, "42": 28153, "43": 30249, "44": 32447, "45": 34748
+        }
+        guild_id = None
+        guild_name = None
+    
+    conn.close()
+    
+    return render_template(
+        'levels.html',
+        thresholds=thresholds,
+        guild_id=guild_id,
+        guild_name=guild_name
+    )
+
+def run_flask():
+    """Run the Flask application."""
+    # Для Replit используем порт 5000 (который потом проксируется на 443)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+
+def run_bot():
+    """Run the Discord bot."""
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+
+if __name__ == "__main__":
+    try:
+        # Start Flask in a separate thread
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        
+        # Start cleanup thread in background
+        cleanup_thread = threading.Thread(target=schedule_cleanup)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        logger.info("Запущен поток планировщика очистки карточек")
+        
+        # Start the bot in the main thread
+        run_bot()
+    except Exception as e:
+        logger.error(f"Error starting application: {e}")
+        if 'flask_thread' in locals() and flask_thread.is_alive():
+            logger.info("Shutting down Flask server...")
+        sys.exit(1)
